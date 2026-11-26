@@ -110,6 +110,7 @@ fn virtual_alloc(
     on_commit: impl FnOnce(usize, usize),
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let (asked_kind, asked_protect) = (kind, protect);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -172,6 +173,9 @@ fn virtual_alloc(
         )
     };
     if base.is_null() {
+        // The census keeps what the title asked for (`VICTORY_CENSUS`).
+        #[cfg(windows)]
+        victory_gpu::title_memory_reserved(at as usize, size, asked_kind, flags, asked_protect);
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
@@ -849,7 +853,8 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let (at, len) = touched(&physical, base, n * PAGE);
+    let _changing = victory_gpu::title_memory_remapping_range(at, len);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -924,61 +929,136 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     mapped
 }
 
-thread_local! {
-    /// The page this thread mapped last through [`map_alias`]: the address
-    /// after it, its section and its index there. For the frame log's
-    /// count of pages that one view could have shown together.
-    static ALIASED: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
-}
-
 /// [`map_alias`] itself; the caller counts it for the frame log.
 fn alias(to: usize, from: usize, len: usize) -> bool {
     use victory_gpu::framelog::{T, add};
     let mut physical = physical();
+    ALIAS[0].fetch_add(1, Ordering::Relaxed);
+    ALIAS[1].fetch_add(len.div_ceil(PAGE) as u64, Ordering::Relaxed);
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let (at, n) = touched(&physical, to, len);
+    let _changing = victory_gpu::title_memory_remapping_range(at, n);
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+    if from == 0 {
+        alias_counts();
+        return true;
+    }
+    // What `unmap` left of `[to, to + len)` is placeholders, one per view
+    // it took away (the GPU's page mappings make one view per page): made
+    // one, so that a run of source pages is mapped with one view where it
+    // took one per page (three system calls and the GPU side's bookkeeping
+    // each). Fails harmlessly where the range is one placeholder already;
+    // a run that still cannot be mapped whole is mapped page by page.
+    // SAFETY: acts on placeholders only, and only over `[to, to + len)`.
+    unsafe { VirtualFree(to as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) };
+    let mut k = 0;
+    while k < len {
+        let Some((base, size, slice)) = view_at(&physical, from + k) else {
+            alias_counts();
             return false;
         };
-        // Counted only: whether this page follows the one mapped just
-        // before, in address and in its section (one view could show
-        // both), or is that very page again (no view can).
-        let (section, index) = (Arc::as_ptr(&slice.section) as usize, slice.index);
-        let (after, last_section, last_index) = ALIASED.get();
-        add(T::RemapAliasPages, 1);
-        if after == to + k && last_section == section {
-            if index == last_index + 1 {
-                add(T::RemapAliasRunPages, 1);
-            } else if index == last_index {
-                add(T::RemapAliasSamePages, 1);
+        // Within one source view the section's pages follow one another.
+        let run = (base + size - (from + k)).min(len - k);
+        let slice = Slice {
+            index: slice.index + (from + k - base) / PAGE,
+            section: slice.section,
+        };
+        ALIAS[3].fetch_add(1, Ordering::Relaxed);
+        let pages = (run / PAGE) as u64;
+        add(T::RemapAliasPages, pages);
+        if run > PAGE && alias_runs() && try_map(&mut physical, to + k, run, slice.clone(), false) {
+            // Pages that followed the one before them in address and in
+            // their section, now shown by the same view.
+            add(T::RemapAliasRunPages, pages - 1);
+        } else {
+            // Page by page, as before.
+            for p in (0..run).step_by(PAGE) {
+                let page = Slice {
+                    index: slice.index + p / PAGE,
+                    section: slice.section.clone(),
+                };
+                if !map(&mut physical, to + k + p, PAGE, page) {
+                    alias_counts();
+                    return false;
+                }
             }
         }
-        ALIASED.set((to + k + PAGE, section, index));
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
-        }
+        k += run;
     }
+    alias_counts();
     true
+}
+
+/// Whether [`map_alias`] maps a run of pool pages as one view
+/// (`VICTORY_ALIAS_RUNS=0`: page by page, as before). fxceless tried the
+/// same and took it back out (README, d510ee4: faces black or red and once
+/// garbage in 3 launches of 3, cause not known), so it can be turned off.
+fn alias_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// `VirtualFree`'s flag that makes adjacent placeholders one (not in
+/// `windows-sys`' list of this version).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+
+/// [`map_alias`]: calls, pages asked for, (unused), and views mapped (one per run of source pages; page by page where a run
+/// could not be mapped whole).
+static ALIAS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Logs [`ALIAS`] every 50,000 calls.
+fn alias_counts() {
+    let calls = ALIAS[0].load(Ordering::Relaxed);
+    if calls.is_multiple_of(50_000) && calls != 0 {
+        tracing::info!(
+            calls,
+            pages = ALIAS[1].load(Ordering::Relaxed),
+            views = ALIAS[3].load(Ordering::Relaxed),
+            "GPU page mappings so far"
+        );
+    }
+}
+
+/// The mapped view holding `at`: its address, length and what it shows.
+fn view_at(physical: &Physical, at: usize) -> Option<(usize, usize, Slice)> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (size, slice))| (*base, *size, slice.clone()))
+}
+
+/// The addresses whose mapping a change of `[base, base + len)` touches,
+/// as `(start, len)`: the range itself and every view that meets it, whole
+/// ([`unmap`] takes a view away whole and maps what stays of it again, so
+/// for a moment none of it is mapped). What the remap lock is taken for
+/// (`victory_gpu::title_memory_remapping_range`).
+fn touched(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len);
+    let (mut start, mut stop) = (base, end);
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
+        && at + size > base
+    {
+        start = at;
+        stop = stop.max(at + size);
+    }
+    if len > 0
+        && let Some((&at, &(size, _))) = physical.views.range(base..end).next_back()
+    {
+        stop = stop.max(at + size);
+    }
+    (start, stop - start)
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    try_map(physical, base, len, slice, true)
+}
+
+/// [`map`], saying nothing of a failure unless `warn`.
+fn try_map(physical: &mut Physical, base: usize, len: usize, slice: Slice, warn: bool) -> bool {
     use victory_gpu::framelog::{T, add};
     let started = std::time::Instant::now();
     // Splits the placeholder around the range (failing harmlessly when the
@@ -1034,6 +1114,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         map_view()
     };
     if view.Value as usize != base {
+        if !warn {
+            return false;
+        }
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
@@ -1461,6 +1544,40 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    /// A run of pool pages is aliased over what single-page aliases left
+    /// (one placeholder per page) with one view, and shows the pool's bytes.
+    #[test]
+    fn an_alias_run_is_one_view() {
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (pool, heap) = (reserve(), reserve());
+        assert!(!pool.is_null() && !heap.is_null());
+        let at = |p: *mut c_void, page: usize| p as usize + page * PAGE;
+        assert_eq!(XMemMapPhysicalPages(pool, 4, pages.as_ptr()), pool);
+        for k in 0..4 {
+            // SAFETY: mapped read-write.
+            unsafe { (at(pool, k) as *mut u8).write(10 + k as u8) };
+        }
+        // Page by page first, the second pool page at every heap page: one
+        // view and one placeholder each.
+        for k in 0..4 {
+            assert!(map_alias(at(heap, k) as u64, at(pool, 1) as u64, PAGE as u64));
+        }
+        // Then the four pool pages over the four heap pages: one view.
+        assert!(map_alias(at(heap, 0) as u64, at(pool, 0) as u64, (4 * PAGE) as u64));
+        {
+            let physical = physical();
+            let (base, size, _) = view_at(&physical, at(heap, 2)).unwrap();
+            assert_eq!((base, size), (at(heap, 0), 4 * PAGE), "the run is not one view");
+        }
+        for k in 0..4 {
+            // SAFETY: mapped read-write.
+            assert_eq!(unsafe { (at(heap, k) as *const u8).read() }, 10 + k as u8);
+        }
     }
 
     #[test]
