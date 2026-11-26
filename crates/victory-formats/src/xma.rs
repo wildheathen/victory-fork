@@ -180,7 +180,13 @@ impl Bits<'_> {
         if n == 0 {
             return 0;
         }
-        let v = self.peek32() >> (32 - n);
+        // `32 - n` underflows for `n > 32` and `u32 >> 32` overflows, so a width
+        // of 32 or more takes the whole 32-bit word.
+        let v = if n >= 32 {
+            self.peek32()
+        } else {
+            self.peek32() >> (32 - n)
+        };
         self.pos += n as usize;
         v
     }
@@ -190,7 +196,14 @@ impl Bits<'_> {
     }
 
     fn signed(&mut self, n: u32) -> i32 {
-        ((self.read(n) << (32 - n)) as i32) >> (32 - n)
+        if n == 0 {
+            return 0;
+        }
+        let v = self.read(n);
+        if n >= 32 {
+            return v as i32;
+        }
+        ((v << (32 - n)) as i32) >> (32 - n)
     }
 
     fn consumed(&self) -> usize {
@@ -1045,6 +1058,40 @@ mod tests {
         let frame = read_frame(&data, start).expect("the frame at `start` is well formed");
         assert_eq!(frame.bits, 200);
         assert_eq!(frame.next, None);
+    }
+
+    #[test]
+    fn bits_handles_zero_and_wide_reads() {
+        let data = [0xAA, 0x55, 0xCC, 0x33, 0xFF, 0x0F];
+        let mut bits = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(bits.read(0), 0);
+        assert_eq!(bits.signed(0), 0);
+        assert_eq!(bits.consumed(), 0);
+        assert_eq!(bits.read(32), 0xAA55_CC33);
+        assert_eq!(bits.read(33), 0xFF0F_0000);
+        assert_eq!(bits.consumed(), 65);
+        assert!(bits.overread());
+
+        let mut sign = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(sign.signed(32), 0xAA55_CC33_u32 as i32);
+        assert_eq!(sign.signed(33), 0xFF0F_0000_u32 as i32);
+
+        let mut neg = Bits {
+            data: &[0b1111_0000, 0b0101_0000],
+            pos: 0,
+            end: 16,
+        };
+        assert_eq!(neg.signed(4), -1);
+        assert_eq!(neg.signed(4), 0);
+        assert_eq!(neg.signed(4), 5);
     }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
