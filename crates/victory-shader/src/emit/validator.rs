@@ -8,6 +8,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 type Hresult = i32;
@@ -109,6 +110,7 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
 };
 
 pub struct Validator {
+    module: HMODULE,
     object: Object,
 }
 
@@ -147,15 +149,19 @@ impl Validator {
             if module.is_null() {
                 return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
             }
-            let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
-                .ok_or("dxil.dll lacks DxcCreateInstance")?;
+            let Some(create) = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast()) else {
+                FreeLibrary(module);
+                return Err("dxil.dll lacks DxcCreateInstance".into());
+            };
             let create: CreateInstance = std::mem::transmute(create);
             let mut object = std::ptr::null_mut();
             let hr = create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object);
             if hr < 0 || object.is_null() {
+                FreeLibrary(module);
                 return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
             }
             Ok(Validator {
+                module,
                 object: object.cast(),
             })
         }
@@ -187,7 +193,11 @@ impl Validator {
             let mut status = 0;
             let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
-            get_status(result, &mut status);
+            let status_hr = get_status(result, &mut status);
+            if status_hr < 0 {
+                release(result);
+                return Err(format!("GetStatus failed: {status_hr:#x}"));
+            }
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
@@ -196,11 +206,15 @@ impl Validator {
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
-                    let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
-                    text = String::from_utf8_lossy(bytes)
-                        .trim_end_matches('\0')
-                        .trim()
-                        .into();
+                    let data = ptr(errors);
+                    let size = len(errors);
+                    if !data.is_null() && size > 0 {
+                        let bytes = std::slice::from_raw_parts(data, size);
+                        text = String::from_utf8_lossy(bytes)
+                            .trim_end_matches('\0')
+                            .trim()
+                            .into();
+                    }
                     release(errors);
                 }
                 if text.is_empty() {
@@ -215,7 +229,264 @@ impl Validator {
 
 impl Drop for Validator {
     fn drop(&mut self) {
-        // SAFETY: we own one reference.
-        unsafe { release(self.object) };
+        // SAFETY: we own one reference on `object`; release it before
+        // unloading `module` so the vtable remains mapped during Release.
+        unsafe {
+            release(self.object);
+            if !self.module.is_null() {
+                FreeLibrary(self.module);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    struct StubBlob {
+        vtable: *const [usize; 5],
+        data: *const u8,
+        len: usize,
+        releases: u32,
+    }
+
+    #[repr(C)]
+    struct StubResult {
+        vtable: *const [usize; 6],
+        status_hr: Hresult,
+        status: Hresult,
+        errors: *mut StubBlob,
+        releases: u32,
+    }
+
+    #[repr(C)]
+    struct StubValidator {
+        vtable: *const [usize; 4],
+        validate_hr: Hresult,
+        result: *mut StubResult,
+        releases: u32,
+    }
+
+    unsafe extern "system" fn stub_noop() -> Hresult {
+        0
+    }
+    unsafe extern "system" fn stub_add_ref(_: *mut c_void) -> u32 {
+        1
+    }
+    unsafe extern "system" fn stub_blob_release(this: *mut StubBlob) -> u32 {
+        unsafe { (*this).releases += 1 };
+        0
+    }
+    unsafe extern "system" fn stub_blob_ptr(this: *mut StubBlob) -> *const u8 {
+        unsafe { (*this).data }
+    }
+    unsafe extern "system" fn stub_blob_len(this: *mut StubBlob) -> usize {
+        unsafe { (*this).len }
+    }
+    unsafe extern "system" fn stub_result_release(this: *mut StubResult) -> u32 {
+        unsafe { (*this).releases += 1 };
+        0
+    }
+    unsafe extern "system" fn stub_get_status(
+        this: *mut StubResult,
+        out: *mut Hresult,
+    ) -> Hresult {
+        unsafe {
+            *out = (*this).status;
+            (*this).status_hr
+        }
+    }
+    unsafe extern "system" fn stub_get_errors(
+        this: *mut StubResult,
+        out: *mut Object,
+    ) -> Hresult {
+        unsafe {
+            *out = (*this).errors.cast();
+        }
+        0
+    }
+    unsafe extern "system" fn stub_validator_release(this: *mut StubValidator) -> u32 {
+        unsafe { (*this).releases += 1 };
+        0
+    }
+    unsafe extern "system" fn stub_validate(
+        this: *mut StubValidator,
+        _blob: *mut Blob,
+        _flags: u32,
+        out: *mut Object,
+    ) -> Hresult {
+        unsafe {
+            *out = (*this).result.cast();
+            (*this).validate_hr
+        }
+    }
+
+    fn make_validator(stub: &mut StubValidator) -> Validator {
+        Validator {
+            module: std::ptr::null_mut(),
+            object: (&raw mut *stub).cast(),
+        }
+    }
+
+    #[test]
+    fn failed_get_status_returns_err_and_releases_result() {
+        let blob_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_blob_release as usize,
+            stub_blob_ptr as usize,
+            stub_blob_len as usize,
+        ];
+        let mut err_blob = StubBlob {
+            vtable: &blob_vt,
+            data: std::ptr::null(),
+            len: 0,
+            releases: 0,
+        };
+        let res_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_result_release as usize,
+            stub_get_status as usize,
+            stub_noop as usize,
+            stub_get_errors as usize,
+        ];
+        let mut result = StubResult {
+            vtable: &res_vt,
+            status_hr: 0x8000_4005_u32 as i32,
+            status: 0,
+            errors: &raw mut err_blob,
+            releases: 0,
+        };
+        let val_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_validator_release as usize,
+            stub_validate as usize,
+        ];
+        let mut stub = StubValidator {
+            vtable: &val_vt,
+            validate_hr: 0,
+            result: &raw mut result,
+            releases: 0,
+        };
+        let mut buf = [0u8; 4];
+        {
+            let mut v = make_validator(&mut stub);
+            let err = v.validate(&mut buf).unwrap_err();
+            assert!(err.contains("GetStatus failed"), "{err}");
+        }
+        assert_eq!(result.releases, 1);
+        assert_eq!(stub.releases, 1);
+    }
+
+    #[test]
+    fn empty_null_error_buffer_falls_back_without_ub() {
+        let blob_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_blob_release as usize,
+            stub_blob_ptr as usize,
+            stub_blob_len as usize,
+        ];
+        let mut err_blob = StubBlob {
+            vtable: &blob_vt,
+            data: std::ptr::null(),
+            len: 0,
+            releases: 0,
+        };
+        let res_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_result_release as usize,
+            stub_get_status as usize,
+            stub_noop as usize,
+            stub_get_errors as usize,
+        ];
+        let mut result = StubResult {
+            vtable: &res_vt,
+            status_hr: 0,
+            status: 0x8000_4005_u32 as i32,
+            errors: &raw mut err_blob,
+            releases: 0,
+        };
+        let val_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_validator_release as usize,
+            stub_validate as usize,
+        ];
+        let mut stub = StubValidator {
+            vtable: &val_vt,
+            validate_hr: 0,
+            result: &raw mut result,
+            releases: 0,
+        };
+        let mut buf = [0u8; 4];
+        {
+            let mut v = make_validator(&mut stub);
+            let err = v.validate(&mut buf).unwrap_err();
+            assert_eq!(err, "rejected (0x80004005)");
+        }
+        assert_eq!(err_blob.releases, 1);
+        assert_eq!(result.releases, 1);
+        assert_eq!(stub.releases, 1);
+    }
+
+    #[test]
+    fn error_message_is_trimmed_and_ok_succeeds() {
+        let msg = b"  bad opcode\n\0";
+        let blob_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_blob_release as usize,
+            stub_blob_ptr as usize,
+            stub_blob_len as usize,
+        ];
+        let mut err_blob = StubBlob {
+            vtable: &blob_vt,
+            data: msg.as_ptr(),
+            len: msg.len(),
+            releases: 0,
+        };
+        let res_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_result_release as usize,
+            stub_get_status as usize,
+            stub_noop as usize,
+            stub_get_errors as usize,
+        ];
+        let mut result = StubResult {
+            vtable: &res_vt,
+            status_hr: 0,
+            status: -1,
+            errors: &raw mut err_blob,
+            releases: 0,
+        };
+        let val_vt = [
+            stub_noop as usize,
+            stub_add_ref as usize,
+            stub_validator_release as usize,
+            stub_validate as usize,
+        ];
+        let mut stub = StubValidator {
+            vtable: &val_vt,
+            validate_hr: 0,
+            result: &raw mut result,
+            releases: 0,
+        };
+        let mut buf = [0u8; 4];
+        {
+            let mut v = make_validator(&mut stub);
+            assert_eq!(v.validate(&mut buf).unwrap_err(), "bad opcode");
+            result.status = 0;
+            assert!(v.validate(&mut buf).is_ok());
+        }
+        assert_eq!(err_blob.releases, 1);
+        assert_eq!(result.releases, 2);
+        assert_eq!(stub.releases, 1);
     }
 }
