@@ -231,7 +231,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         return None;
     }
     Some(AllocationInfo {
-        size: bytes.checked_next_multiple_of(KIB_64)?,
+        size: bytes.checked_next_multiple_of(alignment)?,
         alignment,
     })
 }
@@ -835,14 +835,25 @@ pub(crate) extern "system" fn allocation_info(
     count: u32,
     descs: *const ResourceDesc,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let invalid = AllocationInfo {
+        size: u64::MAX,
+        alignment: 0,
+    };
+    let info = if descs.is_null() {
+        if count == 0 {
+            place(std::iter::empty(), |_, _| ())
+        } else {
+            invalid
+        }
     } else {
         // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter(), |_, _| ())
     };
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the value.
+        unsafe { out.write(info) };
+    }
     out
 }
 
@@ -857,6 +868,7 @@ const _: () = assert!(size_of::<ResourceDesc1>() == 72);
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
@@ -873,51 +885,68 @@ pub(crate) extern "system" fn allocation_info2(
     descs: *const ResourceDesc1,
     each: *mut AllocationInfo1,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let invalid = AllocationInfo {
+        size: u64::MAX,
+        alignment: 0,
+    };
+    let total = if descs.is_null() {
+        if count == 0 {
+            place(std::iter::empty(), |_, _| ())
+        } else {
+            invalid
+        }
     } else {
         // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter().map(|d| &d.desc), |i, info| {
+            if !each.is_null() {
+                // SAFETY: the title passes room for `count` entries.
+                unsafe { each.add(i).write(info) };
+            }
+        })
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
-        if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
-            unsafe { each.add(i).write(info) };
-        }
-    });
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the value.
+        unsafe { out.write(total) };
+    }
     out
 }
 
 /// Resources placed one after another: the whole footprint, telling `each`
-/// where every resource goes. Unknown sizes give the documented `u64::MAX`.
+/// where every resource goes. Unknown sizes or overflows give the documented
+/// `u64::MAX`.
 fn place<'a>(
     descs: impl Iterator<Item = &'a ResourceDesc>,
     mut each: impl FnMut(usize, AllocationInfo1),
 ) -> AllocationInfo {
+    let invalid = AllocationInfo {
+        size: u64::MAX,
+        alignment: 0,
+    };
+    let invalid_each = AllocationInfo1 {
+        offset: u64::MAX,
+        alignment: 0,
+        size: u64::MAX,
+    };
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
             tracing::warn!(?desc, "no size for this resource");
-            each(
-                i,
-                AllocationInfo1 {
-                    offset: u64::MAX,
-                    alignment: 0,
-                    size: u64::MAX,
-                },
-            );
-            return AllocationInfo {
-                size: u64::MAX,
-                alignment: 0,
-            };
+            each(i, invalid_each);
+            return invalid;
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
+        let Some(offset) = total.size.checked_next_multiple_of(one.alignment) else {
+            each(i, invalid_each);
+            return invalid;
+        };
+        let Some(new_size) = offset.checked_add(one.size) else {
+            each(i, invalid_each);
+            return invalid;
+        };
         each(
             i,
             AllocationInfo1 {
@@ -926,9 +955,14 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = new_size;
         total.alignment = total.alignment.max(one.alignment);
     }
+    // Tail padding to the maximum alignment, matching D3D12's C-struct layout.
+    let Some(padded) = total.size.checked_next_multiple_of(total.alignment) else {
+        return invalid;
+    };
+    total.size = padded;
     total
 }
 
@@ -3179,16 +3213,144 @@ mod tests {
             alignment: 0,
         };
         let descs = [buffer(100), texture(256, 256, 28, 0)];
+        let tex_info = footprint(&descs[1]).unwrap();
+        let max_align = KIB_64.max(tex_info.alignment);
+        let expected_size = (KIB_64.next_multiple_of(tex_info.alignment) + tex_info.size)
+            .next_multiple_of(max_align);
         allocation_info(&mut info, std::ptr::null(), 0, 2, descs.as_ptr());
         assert_eq!(
             info,
             AllocationInfo {
-                size: KIB_64 + size(&descs[1]).unwrap(),
-                alignment: KIB_64
+                size: expected_size,
+                alignment: max_align,
             }
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn allocation_info_keeps_console_alignments_and_checks_bounds() {
+        type GetInfo = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc,
+        ) -> *mut AllocationInfo;
+        type GetInfo2 = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc1,
+            *mut AllocationInfo1,
+        ) -> *mut AllocationInfo;
+
+        let device = crate::device::device();
+        let get_info = slot::<GetInfo>(device, 0xc8);
+        let get_info2 = slot::<GetInfo2>(device, 0x360);
+        let invalid = AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        };
+        let invalid_each = AllocationInfo1 {
+            offset: u64::MAX,
+            alignment: 0,
+            size: u64::MAX,
+        };
+        let wrap1 = |desc: ResourceDesc| ResourceDesc1 {
+            desc,
+            mip_region: [0; 3],
+        };
+
+        // Sub-64 KiB alignments (4 KiB SW_4KB_S, 256 B linear) are preserved.
+        let bc7_4k = texture(512, 512, 98, 10);
+        let mut out = invalid;
+        assert_eq!(get_info(&mut out, device, 0, 1, &bc7_4k), &raw mut out);
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        let mut each1 = [invalid_each; 1];
+        let mut out2 = invalid;
+        let bc7_desc1 = [wrap1(bc7_4k)];
+        assert_eq!(
+            get_info2(&mut out2, device, 0, 1, bc7_desc1.as_ptr(), each1.as_mut_ptr()),
+            &raw mut out2
+        );
+        assert_eq!(out2, out);
+        assert_eq!(
+            each1[0],
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 0x1000,
+                size: 0x56000,
+            }
+        );
+
+        let linear_256b = ResourceDesc {
+            layout: 1,
+            ..texture(64, 64, 28, 1)
+        };
+        let linear_fp = footprint(&linear_256b).unwrap();
+        assert_eq!(linear_fp.alignment, 256);
+        get_info(&mut out, device, 0, 1, &linear_256b);
+        assert_eq!(out, linear_fp);
+
+        // Empty queries return { size: 0, alignment: 1 }; null with count > 0 fails.
+        get_info(&mut out, device, 0, 0, std::ptr::null());
+        assert_eq!(out, AllocationInfo { size: 0, alignment: 1 });
+        get_info(&mut out, device, 0, 1, std::ptr::null());
+        assert_eq!(out, invalid);
+        get_info2(&mut out2, device, 0, 1, std::ptr::null(), each1.as_mut_ptr());
+        assert_eq!(out2, invalid);
+
+        // Tail padding matches D3D12's C-struct layout ([64K, 4M, 64K] -> 12M,
+        // [4M, 64K, 64K] -> 8M).
+        let buf_64k = buffer(KIB_64);
+        let msaa_4m = ResourceDesc {
+            sample_count: 4,
+            layout: 2,
+            alignment: MIB_4,
+            ..texture(64, 64, 28, 1)
+        };
+        assert_eq!(
+            footprint(&msaa_4m),
+            Some(AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            })
+        );
+        let mid = [buf_64k, msaa_4m, buf_64k];
+        get_info(&mut out, device, 0, 3, mid.as_ptr());
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: 12 << 20,
+                alignment: MIB_4,
+            }
+        );
+        let first = [msaa_4m, buf_64k, buf_64k];
+        get_info(&mut out, device, 0, 3, first.as_ptr());
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: 8 << 20,
+                alignment: MIB_4,
+            }
+        );
+
+        // Checked arithmetic turns addition and padding overflows into `invalid`.
+        let huge = buffer((1u64 << 63) + KIB_64);
+        let overflow_pair = [wrap1(huge), wrap1(huge)];
+        let mut each2 = [invalid_each; 2];
+        get_info2(&mut out2, device, 0, 2, overflow_pair.as_ptr(), each2.as_mut_ptr());
+        assert_eq!(out2, invalid);
+        assert_eq!(each2[1], invalid_each);
     }
 
     #[test]
