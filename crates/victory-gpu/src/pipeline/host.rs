@@ -611,6 +611,19 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// The wave size range a translated program asks for (its PSV0 part's
+/// minimum and maximum lanes), for the log. From Kelvaroq's patch 0047.
+fn wave_lanes(dxil: &[u8]) -> Option<[u32; 2]> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    let info = psv.get(4..)?.get(..size)?;
+    Some([
+        u32::from_le_bytes(info.get(16..20)?.try_into().ok()?),
+        u32::from_le_bytes(info.get(20..24)?.try_into().ok()?),
+    ])
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -835,7 +848,14 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            if victory_shader::emit::paired_compute_enabled() {
+                // The dispatch grid counts guest groups. Each translated group
+                // still executes all its guest threads, including for ExecuteIndirect.
+                let lanes = stages[0].0.translated().and_then(|t| wave_lanes(&t.host.dxil));
+                tracing::info!(?shaders, wave_lanes = ?lanes, "host compute pipeline");
+            } else {
+                tracing::info!(?shaders, "host pipeline");
+            }
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,

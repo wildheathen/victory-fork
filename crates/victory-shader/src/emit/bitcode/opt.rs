@@ -167,7 +167,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);
@@ -1084,7 +1084,7 @@ impl Module {
     /// Declarations no remaining call names leave the module (the validator
     /// refuses an external function nothing uses); the others keep their
     /// order, so `main` stays function 0.
-    fn drop_unused_functions(&mut self) {
+    pub(super) fn drop_unused_functions(&mut self) {
         let mut used: Vec<bool> = self.funcs.iter().map(|f| f.body).collect();
         for blk in &self.blocks {
             for &i in blk.phis.iter().chain(&blk.body) {

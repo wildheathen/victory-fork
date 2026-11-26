@@ -400,6 +400,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with_paired(c, native, p, st, io, res, paired_compute_enabled())
+}
+
+fn emit_with_paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    allow_paired: bool,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -622,6 +634,23 @@ pub fn emit(
         }
         other => other,
     };
+    let needs_pair = matches!(original, Ok((_, Some(64))))
+        || matches!(&original, Err(ShaderError::Unsupported { what, .. })
+            if lower::needs_every_lane(what) || *what == "a lane permute across two host waves");
+    if needs_pair
+        && lower::host_max_wave() == 32
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && allow_paired
+    {
+        match emit_paired(c, native, p, st) {
+            Ok((shader, Some(32))) => return Ok(shader),
+            Err(e) if std::env::var_os("VICTORY_WAVE_WHY").is_some() => {
+                eprintln!("paired wave64 compute unavailable: {e}");
+            }
+            _ => {}
+        }
+    }
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -637,6 +666,35 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Seven translated compute pipelines requested a wave wider than the
+/// adapter could run. This retry stores two guest lanes in each hardware
+/// lane. The extra register pressure needs measurement on a physical GPU.
+pub fn paired_compute_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_WAVE64_PAIRED").is_some_and(|v| v == "1"))
+}
+
+fn emit_paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let wide = st.wave_any.iter().enumerate().filter_map(|(b, kind)| kind.map(|_| b)).collect();
+    let st = structure::structure_wide(p, &wide)?;
+    for (b, exit) in st.exits.iter().enumerate() {
+        if let structure::LaneExit::Branch { when, .. } = *exit
+            && !wide.contains(&b)
+            && st.bools.support(when).iter().any(|a| !matches!(a, structure::Atom::Uniform(_)))
+        {
+            return Err(ShaderError::Unsupported { offset: 0, what: "a branch without a whole-wave decision" });
+        }
+    }
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

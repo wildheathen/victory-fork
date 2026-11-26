@@ -905,3 +905,6 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+#[path = "paired_tests.rs"]
+mod paired;
