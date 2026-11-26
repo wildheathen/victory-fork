@@ -488,6 +488,7 @@ fn twin_texture(
             &mut texture,
         )
     };
+    crate::census::made(6, 0);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
     }
@@ -2028,6 +2029,10 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        // Its piece of a heap of ours, if it was placed (`crate::texheap`).
+        if self.tiled.is_none() {
+            crate::texheap::release(&self.texture);
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
@@ -2201,6 +2206,20 @@ fn host_texture_as(
                 &mut texture,
             )
         }
+    } else if crate::texheap::on()
+        && d.flags & (TARGET | DEPTH | UNORDERED) == 0
+        && clear_value.is_none()
+        && let Some(placed) = crate::texheap::place(
+            &host.device,
+            // SAFETY: `ResourceDesc` has the host description's layout.
+            unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() },
+            D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+        )
+    {
+        // A piece of a heap of ours (`crate::texheap`): no allocation of
+        // its own in the graphics kernel.
+        texture = Some(placed);
+        Ok(())
     } else {
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
@@ -2218,6 +2237,7 @@ fn host_texture_as(
             )
         }
     };
+    crate::census::made(if reserved { 5 } else { 4 }, 0);
     if let Err(e) = made {
         let why = no_texture(e.code().0);
         // Out of room may come back each second for many textures: its

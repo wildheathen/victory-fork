@@ -252,6 +252,7 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// A buffer of `size` bytes at `offset` (a multiple of 64 KiB) of an
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
+    crate::census::made(7, size);
     let mut placed: Option<ID3D12Resource> = None;
     // The heap is cross-adapter shared, so the buffer must say so too.
     let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -315,6 +316,30 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+}
+
+/// For the census (`crate::census`): how many bytes of `[at, at + len)` are
+/// physical-page views, and how many of those show a page that has more
+/// than one address. Logging only.
+pub(crate) fn view_census(at: usize, len: usize) -> (usize, usize) {
+    let v = views();
+    let end = at.saturating_add(len);
+    let (mut in_views, mut multi) = (0, 0);
+    for (&base, &(vlen, section, offset)) in v.views.range(..end) {
+        let (lo, hi) = (base.max(at), (base + vlen).min(end));
+        if lo >= hi {
+            continue;
+        }
+        in_views += hi - lo;
+        let first = (lo - base) / K64;
+        let last = (hi - base).div_ceil(K64);
+        for k in first..last {
+            if v.pages.get(&(section, offset + (k * K64) as u64)).is_some_and(|l| l.len() > 1) {
+                multi += (base + (k + 1) * K64).min(hi) - (base + k * K64).max(lo);
+            }
+        }
+    }
+    (in_views, multi)
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -481,7 +506,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     }
     // No mapping changes until the bytes are in: the view found below
     // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
+    let _still = crate::watch::title_memory_reading_range_now(at, bytes.len())?;
     let (section, offset, shown, section_bytes) = {
         let v = views();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
