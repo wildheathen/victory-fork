@@ -2265,3 +2265,254 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+#[test]
+fn v_mov_b32_modifiers_are_bitwise() {
+    // VOP3 v_mov_b32_e64 v0, v1 with abs/neg/omod/clamp (VOP3 opcode 0x181 = 0x180 + VOP1 0x001).
+    let neg = build_valu_cs(&vop3_mod(0x181, 0, vgpr(1), 0, 0, 0, 1, 0, false));
+    let abs = build_valu_cs(&vop3_mod(0x181, 0, vgpr(1), 0, 0, 1, 0, 0, false));
+    let neg_abs = build_valu_cs(&vop3_mod(0x181, 0, vgpr(1), 0, 0, 1, 1, 0, false));
+    let neg_mul2 = build_valu_cs(&vop3_mod(0x181, 0, vgpr(1), 0, 0, 0, 1, 1, false));
+    let neg_clamp = build_valu_cs(&vop3_mod(0x181, 0, vgpr(1), 0, 0, 0, 1, 0, true));
+
+    // SDWA: v_mov_b32_sdwa v0, -v1 dst_sel:DWORD dst_unused:PAD src0_sel:DWORD.
+    let sdwa_neg = build_valu_cs(&[
+        0x7E00_0000 | 0x001 << 9 | 0xF9,
+        1 | 6 << 8 | 6 << 16 | 1 << 20,
+    ]);
+
+    let patterns: &[u32] = &[
+        0x3F80_0000, // +1.0
+        0xBF80_0000, // -1.0
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x0000_0001, // +denormal
+        0x8000_0001, // -denormal
+        0x007F_FFFF, // +max denormal
+        0x7F80_0001, // +sNaN
+        0xFF80_0001, // -sNaN
+        0x7FC0_0000, // +qNaN
+        0xFFC0_0001, // -qNaN
+    ];
+
+    let inputs: Vec<[u32; 4]> = patterns.iter().map(|&x| [x, 0, 0, 0]).collect();
+    for (label, cs, want_fn) in [
+        ("neg", &neg, (|x: u32| x ^ 0x8000_0000) as fn(u32) -> u32),
+        ("abs", &abs, |x| x & 0x7FFF_FFFF),
+        ("neg_abs", &neg_abs, |x| (x & 0x7FFF_FFFF) ^ 0x8000_0000),
+        ("sdwa_neg", &sdwa_neg, |x| x ^ 0x8000_0000),
+    ] {
+        run_cases(cs, &inputs, |backend, _, inp, got| {
+            let want = want_fn(inp[0]);
+            assert_eq!(
+                got, want,
+                "{backend}: v_mov_b32[{label}]({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0],
+            );
+        });
+    }
+
+    let float_cases: &[([u32; 4], u32)] = &[
+        ([f32::to_bits(-1.5), 0, 0, 0], f32::to_bits(3.0)),
+        ([f32::to_bits(0.5), 0, 0, 0], f32::to_bits(-1.0)),
+    ];
+    let float_in: Vec<[u32; 4]> = float_cases.iter().map(|c| c.0).collect();
+    run_cases(&neg_mul2, &float_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, float_cases[i].1,
+            "{backend}: v_mov_b32[neg+mul:2]({:#010x}) = {got:#010x}",
+            inp[0],
+        );
+    });
+
+    let clamp_cases: &[([u32; 4], u32)] = &[
+        ([f32::to_bits(-0.5), 0, 0, 0], f32::to_bits(0.5)),
+        ([f32::to_bits(-2.0), 0, 0, 0], f32::to_bits(1.0)),
+        ([f32::to_bits(0.5), 0, 0, 0], 0),
+    ];
+    let clamp_in: Vec<[u32; 4]> = clamp_cases.iter().map(|c| c.0).collect();
+    run_cases(&neg_clamp, &clamp_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, clamp_cases[i].1,
+            "{backend}: v_mov_b32[neg+clamp]({:#010x}) = {got:#010x}",
+            inp[0],
+        );
+    });
+}
+
+#[test]
+fn v_cndmask_b32_modifiers_are_bitwise() {
+    // v_cmp_ne_u32_e64 s6, v3, 0 (VOP3 0x0c5); v_cndmask_b32_e64 v0, v1, v2, s6 (VOP3 0x101).
+    let cmp = vop3(0x0c5, 6, vgpr(3), 0x80, 0);
+    let build = |abs: u8, neg: u8| {
+        let sel = vop3_mod(0x101, 0, vgpr(1), vgpr(2), sgpr(6), abs, neg, 0, false);
+        build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]])
+    };
+    let neg0_only = build(0, 1);
+    let abs0_neg1 = build(1, 2);
+    let neg_abs0_neg1 = build(1, 3);
+
+    let patterns: &[u32] = &[
+        0x3F80_0000,
+        0xBF80_0000,
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x8000_0001,
+        0x7F80_0001,
+        0xFF80_0001,
+        0x7FC0_0000,
+    ];
+    let mut cases = Vec::new();
+    for &x in patterns {
+        cases.push([x, x, 0, 0]);
+        cases.push([x, x, 1, 0]);
+    }
+    for (label, cs, f0, f1) in [
+        (
+            "neg0_only",
+            &neg0_only,
+            (|x: u32| x ^ 0x8000_0000) as fn(u32) -> u32,
+            (|x: u32| x) as fn(u32) -> u32,
+        ),
+        ("abs0_neg1", &abs0_neg1, |x| x & 0x7FFF_FFFF, |x| x ^ 0x8000_0000),
+        (
+            "neg_abs0_neg1",
+            &neg_abs0_neg1,
+            |x| (x & 0x7FFF_FFFF) ^ 0x8000_0000,
+            |x| x ^ 0x8000_0000,
+        ),
+    ] {
+        run_cases(cs, &cases, |backend, _, inp, got| {
+            let want = if inp[2] != 0 { f1(inp[1]) } else { f0(inp[0]) };
+            assert_eq!(
+                got, want,
+                "{backend}: v_cndmask_b32[{label}]({:#010x}, {:#010x}, {}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+}
+
+#[test]
+fn v_cmp_class_f32_matches_rdna2() {
+    let build_mod = |abs0: bool, neg0: bool| {
+        let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+        if abs0 {
+            w0 |= 1 << 8;
+        }
+        if neg0 {
+            w1 |= 1 << 29;
+        }
+        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        build_valu_cs(&[w0, w1, sel[0], sel[1]])
+    };
+    let plain = build_mod(false, false);
+    let neg = build_mod(false, true);
+    let abs = build_mod(true, false);
+    let abs_neg = build_mod(true, true);
+
+    // SDWA: v_cmp_class_f32_sdwa s6, -v1, v2 src0_sel:WORD_0 src1_sel:DWORD.
+    let sdwa_w0 = 0x7C00_0000 | 0x088 << 17 | 2 << 9 | 0xF9;
+    let sdwa_ext = 1 | 6 << 8 | 1 << 15 | 4 << 16 | 1 << 20 | 6 << 24;
+    let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+    let sdwa_word0_neg = build_valu_cs(&[sdwa_w0, sdwa_ext, sel[0], sel[1]]);
+
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // +sNaN
+        (0xFF80_0001, 0), // -sNaN
+        (0x7FC0_0000, 1), // +qNaN
+        (0xFFC0_0001, 1), // -qNaN
+        (0xFF80_0000, 2), // -inf
+        (0xBF80_0000, 3), // -normal (-1.0)
+        (0x8000_0001, 4), // -denormal
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7), // +denormal
+        (0x3F80_0000, 8), // +normal (+1.0)
+        (0x7F80_0000, 9), // +inf
+    ];
+
+    let classify = |bits: u32| -> u32 {
+        let sign = bits >> 31;
+        let exp = (bits >> 23) & 0xFF;
+        let mant = bits & 0x7F_FFFF;
+        if exp == 0xFF && mant != 0 {
+            u32::from(bits & 0x0040_0000 != 0)
+        } else {
+            let pos = if exp == 0xFF {
+                9
+            } else if exp == 0 {
+                if mant == 0 { 6 } else { 7 }
+            } else {
+                8
+            };
+            if sign != 0 { 11 - pos } else { pos }
+        }
+    };
+
+    for (label, cs, xform) in [
+        ("plain", &plain, (|b: u32| b) as fn(u32) -> u32),
+        ("neg", &neg, |b| b ^ 0x8000_0000),
+        ("abs", &abs, |b| b & 0x7FFF_FFFF),
+        ("abs+neg", &abs_neg, |b| (b & 0x7FFF_FFFF) ^ 0x8000_0000),
+    ] {
+        let mut cases = Vec::new();
+        for &(bits, base_cls) in classes {
+            if label == "plain" {
+                assert_eq!(classify(bits), base_cls);
+            }
+            let cls = classify(xform(bits));
+            cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+            cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+        }
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(cs, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_cmp_class_f32[{label}]({:#010x}, {:#05x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    let sdwa_cases: &[([u32; 4], u32)] = &[
+        ([0xDEAD_0001, 1 << 4, 0, 0], 1),
+        ([0xDEAD_0001, 1 << 5, 0, 0], 0),
+        ([0xBEEF_0000, 1 << 5, 0, 0], 1),
+    ];
+    let sdwa_in: Vec<[u32; 4]> = sdwa_cases.iter().map(|c| c.0).collect();
+    run_cases(&sdwa_word0_neg, &sdwa_in, |backend, i, inp, got| {
+        let want = sdwa_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32_sdwa(-word0({:#010x}), {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn typed_buffer_loads_zero_missing_channels() {
+    // MTBUF tbuffer_load_format_xyzw v[vdata:vdata+3], off, s[srsrc:srsrc+3], 0 format:fmt
+    const fn mtbuf_load_xyzw(vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+        [
+            0x3A << 26 | (u32::from(format) & 0x7F) << 19 | 0x03 << 15,
+            0x80 << 24 | ((u32::from(srsrc) >> 2) & 0x1F) << 16 | (u32::from(vdata) << 8),
+        ]
+    }
+    for (format, input) in [(20, 0x0123_4567), (22, 0x3F80_0000)] {
+        // Store a 32_UINT or 32_FLOAT element, then read its four channels.
+        // XOR X and W together to check that X survived and W is zero.
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mtbuf_load_xyzw(4, 8, format));
+        body.extend(vop3(0x11D, 0, vgpr(4), vgpr(7), 0)); // v_xor_b32 v0, v4, v7
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[input, 0, 0, 0]], |label, _, _, got| {
+            assert_eq!(got, input, "{label}, format {format}");
+        });
+    }
+}

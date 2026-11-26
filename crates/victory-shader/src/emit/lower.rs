@@ -3459,6 +3459,36 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Raw 32-bit operand bits with `abs`/`neg` applied bitwise on bit 31
+    /// (for typeless `_b32` and `v_cmp_class_f32` instructions, without
+    /// flushing denormals or quieting signalling NaNs).
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => {
+                let x = self.operand(inst, &op)?;
+                match Self::sdwa_src(inst, k) {
+                    Some((sel, sext)) => self.select_bits(x, sel, sext),
+                    None => x,
+                }
+            }
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let s = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, s);
+        }
+        Ok(x)
+    }
+
     fn unary(&mut self, op: u32, f: V) -> V {
         self.s.op(
             self.cur,
@@ -6311,13 +6341,13 @@ impl<'a> Lower<'a> {
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
-    // shortcut: the descriptor's channel swizzle is taken as the identity
-    // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    /// typed loads (`MTBUF`) do. Channels past the format's read 0, the 4th
+    /// included, and the descriptor's `dst_sel` does not apply (measured on
+    /// gfx1036 for issue #1060).
+    // shortcut: elements of 4 bytes or more are taken as dword-aligned.
+    // Norm formats divide, which the AMD driver does 1 ULP off the
+    // hardware's correctly rounded conversion for some values; correct it
+    // with an integer check if a title compares converted values exactly.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -6419,14 +6449,7 @@ impl<'a> Lower<'a> {
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
-        }
-        out.truncate(channels as usize);
+        out.resize(channels as usize, self.s.m.i32(0));
         Ok(out)
     }
 
@@ -7241,11 +7264,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
-                    let a = f(self, 0)?;
-                    return float(self, a);
+                let a = self.src_bits(inst, 0)?;
+                if v.clamp || v.omod != 0 {
+                    let f = self.as_float(a);
+                    return float(self, f);
                 }
-                let a = s(self, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -7729,12 +7752,7 @@ impl<'a> Lower<'a> {
                     }
                     None => return Err(UNTRACKED),
                 };
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let (a, bb) = (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
@@ -9183,8 +9201,7 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    self.src_bits(inst, 0)?
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -12313,5 +12330,48 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn missing_typed_buffer_channels_are_zero() {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: S_ENDPGM.to_le_bytes().to_vec(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io::raise(&p, &native).unwrap(),
+            res: &resource::Resources::default(),
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = Default::default();
+        let mut lower = super::Lower::new(&parts, &bad);
+        let zero = lower.s.m.i32(0);
+        let h = lower.s.heap_handle(0, zero, false, false, (11, 0));
+        for (format, present) in [(20, 1), (22, 1), (29, 2), (74, 3), (77, 4)] {
+            let channels = lower.format_load(h, zero, format, 4).unwrap();
+            assert_eq!(channels.len(), 4);
+            assert!(channels[..present].iter().all(|&v| v != zero));
+            assert_eq!(
+                &channels[present..],
+                &[zero; 4][present..],
+                "format {format}"
+            );
+        }
     }
 }
