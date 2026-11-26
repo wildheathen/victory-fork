@@ -1774,7 +1774,7 @@ fn effects(
             }
         }
     }
-    if vector {
+    if vector && !matches!(name, "v_readlane_b32" | "v_writelane_b32") {
         r.extend(mask(EXEC));
     }
     let mut seen = Vec::with_capacity(r.len());
@@ -2120,5 +2120,29 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn readlane_and_writelane_do_not_read_exec_implicitly() {
+        // v_writelane_b32 v1, s0, 0; v_readlane_b32 s1, v1, 0; s_endpgm
+        let code = [
+            0xD761_0001,
+            (128 << 9) | 0, // src0 = s0, src1 = 0 (inline const 128)
+            0xD760_0001,
+            (128 << 9) | 257, // src0 = v1 (256+1), src1 = 0 (inline const 128)
+            S_ENDPGM,
+        ];
+        for wave64 in [false, true] {
+            let p = build_words(&code, wave64);
+            let [writelane, readlane, _] = &p.blocks[0].insts[..] else {
+                panic!("{:?}", p.blocks[0].insts);
+            };
+            assert_eq!(writelane.read(Reg::S(EXEC)), None);
+            assert_eq!(writelane.read(Reg::S(EXEC + 1)), None);
+            assert_eq!(readlane.read(Reg::S(EXEC)), None);
+            assert_eq!(readlane.read(Reg::S(EXEC + 1)), None);
+            // Destination VGPR old value is still kept for untouched lanes.
+            assert!(writelane.read(Reg::V(1)).is_some());
+        }
     }
 }

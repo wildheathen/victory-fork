@@ -4534,6 +4534,18 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Masks a console lane selector to `[0, wave_size)` (`& 31` in Wave32,
+    /// `& 63` in Wave64), folding constants so DXIL never sees an out-of-range
+    /// immediate lane index.
+    fn mask_lane(&mut self, lane: V) -> V {
+        let mask = self.wave() - 1;
+        if let Some(x) = self.s.m.int_value(lane) {
+            return self.s.m.i32((x as u32) & mask);
+        }
+        let m = self.s.m.i32(mask);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
@@ -7775,11 +7787,13 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let host_lane = self.mask_data == MaskData::Host && !matches!(lane, V::Const(_));
+                if host_lane {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
                 }
+                let lane = if host_lane { lane } else { self.mask_lane(lane) };
                 if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
                     if self.local && self.local_any {
                         // this host wave's lane of that number (lanes 32..63 are 0..31 here)
@@ -7821,6 +7835,7 @@ impl<'a> Lower<'a> {
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
+                // `v_writelane_b32` ignores EXEC and masks the selector to the wave size.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -7833,10 +7848,11 @@ impl<'a> Lower<'a> {
                 if self.local && !self.local_any {
                     return Err("a lane write in a half-wave");
                 }
+                let lane = self.mask_lane(lane);
                 let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst

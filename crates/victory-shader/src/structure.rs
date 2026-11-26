@@ -1644,6 +1644,26 @@ mod tests {
     }
 
     #[test]
+    fn readlane_and_writelane_are_unguarded_under_narrowed_exec() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0xD761_0001,
+                (128 << 9) | 0, // v_writelane_b32 v1, s0, 0
+                0xD760_0001,
+                (128 << 9) | 257, // v_readlane_b32 s1, v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(s.guards[0][1], None, "v_writelane_b32 ignores EXEC");
+        assert_eq!(s.guards[0][2], None, "v_readlane_b32 ignores EXEC");
+        assert!(s.guards[0][3].is_some(), "v_mov_b32 still guarded by EXEC");
+    }
+
+    #[test]
     fn divergent_loop_exits_per_lane() {
         let p = build(
             &[
