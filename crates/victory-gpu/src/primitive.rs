@@ -127,8 +127,14 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exp = (bits >> 23) & 0xff;
     let man = bits & 0x7f_ffff;
+    if raw_exp == 0xff && man != 0 {
+        // Quiet NaN keeping the sign and upper payload bits (and ensuring a
+        // signaling NaN whose payload is only in the low bits stays NaN).
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
+    let exp = raw_exp as i32 - 127 + 15;
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -147,10 +153,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
+    // Rounded to nearest even: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let lsb = (man >> 13) & 1;
+    sign | (half + ((man + 0x0fff + lsb) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -233,5 +240,38 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn f32_to_half_preserves_nan_and_rounds_normals_to_nearest_even() {
+        // Quiet and signaling NaNs in both signs keep NaN (never infinity).
+        assert_eq!(f32_to_half(f32::from_bits(0x7fc0_0000)), 0x7e00);
+        assert_eq!(f32_to_half(f32::from_bits(0xffc0_0000)), 0xfe00);
+        assert_eq!(f32_to_half(f32::from_bits(0x7f80_0001)), 0x7e00);
+        assert_eq!(f32_to_half(f32::from_bits(0xff80_0001)), 0xfe00);
+        assert_eq!(f32_to_half(f32::from_bits(0x7fe0_2000)), 0x7f01);
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+
+        // Normal ties go to even mantissa LSB.
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(-(1.0 + 2f32.powi(-11))), 0xbc00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        assert_eq!(f32_to_half(-(1.0 + 3.0 * 2f32.powi(-11))), 0xbc02);
+        // Overflow boundary: tie at 65536 - 16 = 65520 rounds to even (infinity).
+        assert_eq!(f32_to_half(65519.0), 0x7bff);
+        assert_eq!(f32_to_half(65520.0), 0x7c00);
+
+        // Every finite/infinite half round-trips, and every NaN half stays a same-sign NaN.
+        for h in 0..=u16::MAX {
+            let back = f32_to_half(half_to_f32(h));
+            if (h & 0x7c00) == 0x7c00 && (h & 0x03ff) != 0 {
+                assert_eq!(back & 0x8000, h & 0x8000);
+                assert_eq!(back & 0x7c00, 0x7c00);
+                assert_ne!(back & 0x03ff, 0);
+            } else {
+                assert_eq!(back, h, "round-trip failed for 0x{h:04x}");
+            }
+        }
     }
 }
