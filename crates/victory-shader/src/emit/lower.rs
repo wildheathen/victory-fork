@@ -977,7 +977,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
         }
         for a in st.bools.support(g) {
             match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
+                Atom::Opaque(..) | Atom::Constant(_) => return true,
                 Atom::Phi(id) if joins.insert(id) => {
                     if let Some(edges) = st.phi_masks.get(&id) {
                         work.extend(edges.iter().copied());
@@ -3801,18 +3801,17 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
+            Atom::Opaque(lo, hi) if self.console_lanes => {
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
                 };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
+                let lo = word(self.get(lo)?)?;
+                let hi = if self.x.native.wave64 {
+                    Some(word(self.get(hi)?)?)
+                } else {
+                    None
+                };
                 Ok(self.lane_bit(at, lo, hi))
             }
             Atom::Constant(k) if self.console_lanes => {
@@ -3820,7 +3819,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
@@ -4085,38 +4084,6 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
-    }
-
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
-        }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
-        }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -12329,5 +12296,29 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn a_wave64_select_on_a_mask_set_by_halves_reads_its_high_dword() {
+        let lower_hi = |hi_const: u32| {
+            let cnd = 128 | (193 << 9) | (10 << 18); // v_cndmask_b32 v1, 0, -1, s[10:11]
+            let words = [
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                hi_const,    // s_mov_b32 s11, 0 or -1
+                0xD765_0002,
+                0x0001_00C1, // v_mbcnt_lo_u32_b32 v2, -1, 0
+                0xD501_0001,
+                cnd,
+                0xD834_0000,
+                0x0000_0102, // ds_write_b32 v2, v1
+                S_ENDPGM,
+            ];
+            lower_wave(&words, vec![], vec![], true).unwrap().dxil
+        };
+        assert_ne!(
+            lower_hi(0xBE8B_0380),
+            lower_hi(0xBE8B_03C1),
+            "lanes 32-63 must test s11 rather than s10"
+        );
     }
 }

@@ -46,8 +46,8 @@ pub enum Atom {
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// `(lo, hi)` (both `lo` in wave32).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -964,7 +964,7 @@ impl<'a> Lanes<'a> {
                             self.b
                                 .support(m)
                                 .iter()
-                                .all(|a| !matches!(a, Atom::Opaque(_)))
+                                .all(|a| !matches!(a, Atom::Opaque(..)))
                                 .then_some((m, derived))
                         });
                         copied.map_or_else(
@@ -973,11 +973,9 @@ impl<'a> Lanes<'a> {
                         )
                     }
                 };
-                // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it.
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque(k.0, k.1), born)
                 });
                 (m, derived)
             }
@@ -1813,7 +1811,7 @@ mod tests {
             s.bools
                 .support(guard)
                 .iter()
-                .any(|a| matches!(a, Atom::Opaque(_)))
+                .any(|a| matches!(a, Atom::Opaque(..)))
         );
     }
 
@@ -1841,6 +1839,26 @@ mod tests {
             let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
             assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
         }
+    }
+
+    #[test]
+    fn wave64_opaque_mask_written_by_halves_carries_both_dwords() {
+        let cnd = 256 | (257 << 9) | (10 << 18); // v_cndmask_b32 v1, v0, v1, s[10:11]
+        let p = build(
+            &[
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                0xBE8B_03C1, // s_mov_b32 s11, -1
+                0xD501_0001,
+                cnd,
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lo = p.blocks[0].insts[0].write(Reg::S(10)).unwrap();
+        let hi = p.blocks[0].insts[1].write(Reg::S(11)).unwrap();
+        let m = s.masks[&lo];
+        assert_eq!(s.bools.support(m), vec![Atom::Opaque(lo, hi)]);
     }
 
     #[test]
