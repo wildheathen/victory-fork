@@ -484,7 +484,9 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let Some(number) = current.as_ref().map_or(Some(1), |v| v.number.checked_add(1)) else {
+            return NO_ACCESS;
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -1045,6 +1047,20 @@ mod tests {
         assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
         assert_eq!(state(root.path()), Some(("four".into(), vec![("a".into(), "fourth a".into())])));
         assert_eq!(versions(), 1);
+    }
+
+    #[test]
+    fn no_version_above_u64_max_is_refused_and_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let max = u64::MAX;
+        assert_eq!(update(root.path(), "one", &[("a", Some("kept"))]), S_OK);
+        // Simulate a valid committed v18446744073709551615 (or stray folder with manifest)
+        // alongside v1; in either case the next version cannot increment past u64::MAX.
+        commit(&dir, max, "Slot", "max", &[("a", Source::Data(b"max"))]).unwrap();
+        assert_eq!(update(root.path(), "two", &[("a", Some("lost"))]), NO_ACCESS);
+        assert!(!dir.join("v0").exists());
+        assert_eq!(state(root.path()), Some(("max".into(), vec![("a".into(), "max".into())])));
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
