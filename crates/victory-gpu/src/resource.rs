@@ -2913,8 +2913,14 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
+        let mut desc = resource(this).desc;
+        // Native D3D12 reports the allocated chain length when a texture
+        // is created with MipLevels == 0.
+        if desc.dimension != BUFFER && desc.mip_levels == 0 {
+            desc.mip_levels = mip_count(&desc) as u16;
+        }
         // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+        unsafe { out.write(desc) };
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -4465,5 +4471,61 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn get_desc_reports_the_allocated_mip_chain() {
+        type Desc = extern "system" fn(This, *mut ResourceDesc);
+        let null = std::ptr::null();
+        let create = |desc: &ResourceDesc, out: &mut This| {
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    out,
+                ),
+                S_OK
+            );
+        };
+        let reported = |this: This| {
+            let mut desc = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+            slot::<Desc>(this, 0x50)(this, desc.as_mut_ptr());
+            // SAFETY: `resource_desc` initialized `desc`.
+            unsafe { desc.assume_init() }.mip_levels
+        };
+
+        // 2D 4x4 automatic -> 3 levels
+        let mut automatic_2d = null;
+        create(&texture(4, 4, 28, 0), &mut automatic_2d);
+        assert_eq!(reported(automatic_2d), 3);
+        assert_eq!(slot::<Release>(automatic_2d, 0x10)(automatic_2d), 0);
+
+        // 3D 7x5x9 automatic -> 4 levels
+        let mut automatic_3d = null;
+        let desc_3d = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: 9,
+            ..texture(7, 5, 28, 0)
+        };
+        create(&desc_3d, &mut automatic_3d);
+        assert_eq!(reported(automatic_3d), 4);
+        assert_eq!(slot::<Release>(automatic_3d, 0x10)(automatic_3d), 0);
+
+        // Explicit count preserved
+        let mut explicit = null;
+        create(&texture(16, 16, 28, 2), &mut explicit);
+        assert_eq!(reported(explicit), 2);
+        assert_eq!(slot::<Release>(explicit, 0x10)(explicit), 0);
+
+        // Buffers keep their stored mip_levels
+        let mut buf = null;
+        create(&buffer(256), &mut buf);
+        assert_eq!(reported(buf), 1);
+        assert_eq!(slot::<Release>(buf, 0x10)(buf), 0);
     }
 }
